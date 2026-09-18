@@ -263,7 +263,7 @@ export class PiAcpSession {
   private startupInfo: string | null = null
   private startupInfoSent = false
 
-  readonly proc: PiRpcProcess
+  proc: PiRpcProcess
   private readonly conn: AgentSideConnection
   private readonly fileCommands: FileSlashCommand[]
 
@@ -291,6 +291,16 @@ export class PiAcpSession {
   private fileMutationToolCallIds = new Set<string>()
   private bashToolCallIds = new Set<string>()
   private bashOutputSnapshots = new Map<string, string>()
+
+  /**
+   * Point this session at a different pi subprocess. Used by session/fork:
+   * the live subprocess (which pi already switched onto the forked branch)
+   * is handed to the new session id, and the original session gets a fresh
+   * subprocess bound to its own session file.
+   */
+  swapProc(proc: PiRpcProcess): void {
+    this.proc = proc
+  }
 
   // Ensure `session/update` notifications are sent in order and can be awaited
   // before completing a `session/prompt` request.

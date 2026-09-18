@@ -49,6 +49,10 @@ type PiRpcCommand =
   | { type: 'switch_session'; id?: string; sessionPath: string }
   // Messages
   | { type: 'get_messages'; id?: string }
+  // Fork / clone
+  | { type: 'get_fork_messages'; id?: string }
+  | { type: 'fork'; id?: string; entryId: string }
+  | { type: 'clone'; id?: string }
   // Commands
   | { type: 'get_commands'; id?: string }
 
@@ -317,6 +321,27 @@ export class PiRpcProcess {
     const res = await this.request({ type: 'get_commands' })
     if (!res.success) throw new Error(`pi get_commands failed: ${res.error ?? JSON.stringify(res.data)}`)
     return res.data
+  }
+
+  /** User messages available for forking: `{ messages: [{ entryId, text }] }`. */
+  async getForkMessages(): Promise<{ messages?: Array<{ entryId?: string; text?: string }> }> {
+    const res = await this.request({ type: 'get_fork_messages' })
+    if (!res.success) throw new Error(`pi get_fork_messages failed: ${res.error ?? JSON.stringify(res.data)}`)
+    return (res.data ?? {}) as { messages?: Array<{ entryId?: string; text?: string }> }
+  }
+
+  /** Fork the session from a previous user message (pi branches in place). */
+  async forkSession(entryId: string): Promise<{ text?: string; cancelled?: boolean }> {
+    const res = await this.request({ type: 'fork', entryId })
+    if (!res.success) throw new Error(`pi fork failed: ${res.error ?? JSON.stringify(res.data)}`)
+    return (res.data ?? {}) as { text?: string; cancelled?: boolean }
+  }
+
+  /** Duplicate the active branch into a new session at the current position. */
+  async cloneSession(): Promise<{ cancelled?: boolean }> {
+    const res = await this.request({ type: 'clone' })
+    if (!res.success) throw new Error(`pi clone failed: ${res.error ?? JSON.stringify(res.data)}`)
+    return (res.data ?? {}) as { cancelled?: boolean }
   }
 
   async sendExtensionUiResponse(response: PiExtensionUiResponse): Promise<void> {

@@ -21,8 +21,13 @@ import {
   type SetSessionModeResponse,
   type StopReason,
   type DeleteSessionRequest,
-  type DeleteSessionResponse
+  type DeleteSessionResponse,
+  type ForkSessionRequest,
+  type ForkSessionResponse,
+  type ResumeSessionRequest,
+  type ResumeSessionResponse
 } from '@agentclientprotocol/sdk'
+import { createHash } from 'node:crypto'
 import { getAuthMethods } from './auth.js'
 import { SessionManager, type PiAcpSession } from './session.js'
 import { SessionStore } from './session-store.js'
@@ -116,6 +121,63 @@ function mergeCommands(a: AvailableCommand[], b: AvailableCommand[]): AvailableC
 
   return out
 }
+
+/**
+ * Resolve a codeg-style ForkPoint (`sha256:<hex>` of agent message text +
+ * 1-based occurrence) to the pi user-message entryId to fork from.
+ *
+ * pi forks from USER messages, while the fingerprint names an AGENT reply —
+ * so the fork point is the first user message AFTER the matched reply. When
+ * the reply is the turn tail (no following user message), returns undefined
+ * → the caller falls back to a tail fork (pi `clone`). Same fallback when the
+ * fingerprint matches nothing (text normalization drift, empty turn).
+ */
+async function resolveForkEntryId(
+  proc: PiRpcProcess,
+  forkMeta: { messageId?: string; messageFingerprint?: string; messageOccurrence?: number }
+): Promise<string | undefined> {
+  const fingerprint = forkMeta.messageFingerprint ?? ''
+  if (!fingerprint.startsWith('sha256:')) return undefined
+  const occurrence = Math.max(1, forkMeta.messageOccurrence ?? 1)
+
+  const data = (await proc.getMessages()) as any
+  const messages: any[] = Array.isArray(data?.messages) ? data.messages : []
+  const texts = messages.map((m: any) => ({
+    role: String(m?.role ?? ''),
+    text: normalizePiAssistantText(m?.content)
+  }))
+
+  // Find the occurrence-th assistant message whose text hashes to the fingerprint.
+  let targetIdx = -1
+  let seen = 0
+  for (let i = 0; i < texts.length; i++) {
+    if (texts[i]!.role !== 'assistant') continue
+    const digest = createHash('sha256').update(texts[i]!.text, 'utf8').digest('hex')
+    if (`sha256:${digest}` === fingerprint) {
+      seen++
+      if (seen === occurrence) {
+        targetIdx = i
+        break
+      }
+    }
+  }
+  if (targetIdx === -1) return undefined
+
+  // Fork from the first user message after the matched reply.
+  let userOrdinal = -1
+  for (let i = targetIdx + 1; i < texts.length; i++) {
+    if (texts[i]!.role !== 'user') continue
+    userOrdinal = texts.slice(0, i).filter((t) => t.role === 'user').length
+    break
+  }
+  if (userOrdinal === -1) return undefined // reply is the tail
+
+  const forkMsgs = await proc.getForkMessages()
+  const candidates = forkMsgs.messages ?? []
+  const entryId = candidates[userOrdinal]?.entryId
+  return typeof entryId === 'string' && entryId.length > 0 ? entryId : undefined
+}
+
 import { fileURLToPath } from 'node:url'
 
 const pkg = readNearestPackageJson(import.meta.url)
@@ -263,7 +325,14 @@ export class PiAcpAgent implements ACPAgent {
           // **UNSTABLE** ACP capability used by Zed's codex-acp adapter.
           // Enables a native session picker in clients that support it.
           list: {},
-          delete: {}
+          delete: {},
+          // Fork/resume: pi's RPC supports forking from a previous user
+          // message (`fork`, `clone`, `get_fork_messages`) and resuming a
+          // stored session file. Advertising these lets ACP clients (e.g.
+          // codeg) show per-message fork affordances for pi sessions and
+          // reconnect without a full history replay.
+          fork: {},
+          resume: {}
         }
       }
     }
@@ -401,7 +470,7 @@ export class PiAcpAgent implements ACPAgent {
           const pi = (await session.proc.getCommands()) as any
           const { commands } = toAvailableCommandsFromPiGetCommands(pi, {
             enableSkillCommands,
-            includeExtensionCommands: false
+            includeExtensionCommands: process.env.PI_ACP_INCLUDE_EXTENSION_COMMANDS !== 'false'
           })
 
           await this.conn.sessionUpdate({
@@ -1080,7 +1149,7 @@ export class PiAcpAgent implements ACPAgent {
           const pi = (await proc.getCommands()) as any
           const { commands } = toAvailableCommandsFromPiGetCommands(pi, {
             enableSkillCommands,
-            includeExtensionCommands: false
+            includeExtensionCommands: process.env.PI_ACP_INCLUDE_EXTENSION_COMMANDS !== 'false'
           })
 
           await this.conn.sessionUpdate({
@@ -1106,6 +1175,143 @@ export class PiAcpAgent implements ACPAgent {
     }, 0)
 
     return response
+  }
+
+  /**
+   * ACP `session/resume`: reconnect to a stored session WITHOUT replaying its
+   * history. Unlike `session/load` (which streams the full transcript back as
+   * session updates), resume just rebinds the session so subsequent prompts
+   * continue it — for clients that already hold the history (e.g. codeg,
+   * which parses pi's session files itself).
+   */
+  async resumeSession(params: ResumeSessionRequest): Promise<ResumeSessionResponse> {
+    if (!isAbsolute(params.cwd)) {
+      throw RequestError.invalidParams(`cwd must be an absolute path: ${params.cwd}`)
+    }
+
+    this.lastSessionCwd = params.cwd
+
+    const stored = this.findStoredSession(params.sessionId)
+    if (!stored) {
+      throw RequestError.invalidParams(`Unknown sessionId: ${params.sessionId}`)
+    }
+
+    const session = await this.restoreSession(params.sessionId, {
+      cwd: params.cwd,
+      mcpServers: params.mcpServers
+    })
+
+    ;(this.sessions as any).closeAllExcept?.(session.sessionId)
+    this.store.upsert({ sessionId: params.sessionId, cwd: params.cwd, sessionFile: stored.sessionFile })
+
+    try {
+      const { configOptions, modes } = await getSessionConfiguration(session.proc)
+      return { modes, configOptions }
+    } catch {
+      return {}
+    }
+  }
+
+  /**
+   * ACP `session/fork`: branch a session at a point in its history.
+   *
+   * Clients describe the fork point via `_meta["jetbrains.air.fork"]`
+   * (`ForkPoint` convention shared by codeg/claude-agent-acp/codex-acp):
+   * `messageId`, optional `messageFingerprint` (`sha256:<hex>` of the agent
+   * message text) and optional `messageOccurrence` (1-based index among agent
+   * messages sharing the fingerprint). Absent or unresolvable → fork at the
+   * tail (pi `clone`), which is the convention's documented fallback.
+   *
+   * pi forks FROM a user message, so a fingerprint naming an agent reply
+   * resolves to the user message that FOLLOWS that reply. If the reply is the
+   * turn tail, the fork is the tail (clone).
+   *
+   * Returns the NEW sessionId. The original session keeps its own history and
+   * stays usable: it is re-bound to a fresh pi subprocess on the old session
+   * file, while the forked session inherits the live subprocess (which pi
+   * already switched onto the forked branch).
+   */
+  async unstable_forkSession(params: ForkSessionRequest): Promise<ForkSessionResponse> {
+    if (!isAbsolute(params.cwd)) {
+      throw RequestError.invalidParams(`cwd must be an absolute path: ${params.cwd}`)
+    }
+
+    const stored = this.findStoredSession(params.sessionId)
+    if (!stored) {
+      throw RequestError.invalidParams(`Unknown sessionId: ${params.sessionId}`)
+    }
+
+    const session = await this.restoreSession(params.sessionId, {
+      cwd: params.cwd,
+      mcpServers: params.mcpServers
+    })
+    const proc = session.proc
+
+    const forkMeta = (params as any)?._meta?.jetbrains?.air?.fork as
+      | { messageId?: string; messageFingerprint?: string; messageOccurrence?: number }
+      | undefined
+
+    // Resolve the fork point to a pi user-message entryId, if possible.
+    let entryId: string | undefined
+    if (forkMeta?.messageFingerprint) {
+      entryId = await resolveForkEntryId(proc, forkMeta)
+    }
+
+    if (entryId) {
+      const res = await proc.forkSession(entryId)
+      if (res.cancelled) {
+        throw RequestError.internalError({}, 'pi fork cancelled by a session_before_fork handler')
+      }
+    } else {
+      // Tail fork: duplicate the active branch at the current position.
+      const res = await proc.cloneSession()
+      if (res.cancelled) {
+        throw RequestError.internalError({}, 'pi clone cancelled by a session_before_fork handler')
+      }
+    }
+
+    // pi switched this subprocess onto the forked session.
+    const state = (await proc.getState()) as any
+    const newSessionId = typeof state?.sessionId === 'string' ? state.sessionId : crypto.randomUUID()
+    const newSessionFile = typeof state?.sessionFile === 'string' ? state.sessionFile : null
+    if (newSessionFile && newSessionFile === stored.sessionFile) {
+      throw RequestError.internalError({}, 'pi fork did not switch to a new session file')
+    }
+
+    // Hand the live subprocess to the forked session.
+    const forkedSession = this.sessions.getOrCreate(newSessionId, {
+      cwd: params.cwd,
+      mcpServers: params.mcpServers ?? [],
+      conn: this.conn,
+      proc,
+      fileCommands: loadSlashCommands(params.cwd)
+    })
+    if (newSessionFile) {
+      this.store.upsert({ sessionId: newSessionId, cwd: params.cwd, sessionFile: newSessionFile })
+    }
+
+    // Give the ORIGINAL session a fresh subprocess on its own file so both
+    // sides stay usable independently.
+    if (stored.sessionFile) {
+      try {
+        const freshProc = await PiRpcProcess.spawn({
+          cwd: params.cwd,
+          sessionPath: stored.sessionFile,
+          piCommand: process.env.PI_ACP_PI_COMMAND
+        })
+        session.swapProc(freshProc)
+      } catch {
+        // The original session keeps the (now forked) subprocess; it will
+        // recover on the next session/load.
+      }
+    }
+
+    const { modes, configOptions } = await getSessionConfiguration(forkedSession.proc).catch(() => ({
+      modes: undefined,
+      configOptions: undefined
+    }))
+
+    return { sessionId: newSessionId, modes, configOptions }
   }
 
   async deleteSession(params: DeleteSessionRequest): Promise<DeleteSessionResponse> {
