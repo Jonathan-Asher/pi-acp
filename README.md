@@ -26,6 +26,10 @@ Expect some minor breaking changes.
   - Adds a small set of built-in commands for headless/editor usage
   - Supports skill commands (if enabled in pi settings, they appear as `/skill:skill-name` in the ACP client)
 - Skills are loaded by pi directly and are available in ACP sessions
+- Steering (`_session/steering`, advertised as `_meta.steering.supported` in the `initialize` response)
+  - While a turn runs, the message goes into pi's steering queue (`injected`). pi delivers it after the current tool calls, and the turn's `session/prompt` resolves only after pi has processed it
+  - With no running turn, clients that send `_meta.steering.idleBehavior: "promptRequired"` get `promptRequired` and the message is left untouched; other clients get `startedNewTurn` and the message runs as a new turn
+  - If the turn ends just as the steer reaches pi, the message is taken back out of pi's queue and run in the same turn, so it is never lost or left queued for a later prompt
 - (Zed) `pi-acp` emits “startup info” block into the session (pi version, context, skills, prompts, extensions - similar to `pi` in the terminal). You can disable it by setting `quietStartup: true` in pi settings (`~/.pi/agent/settings.json` or `<project>/.pi/settings.json`). When `quietStartup` is enabled, `pi-acp` will still emit a 'New version available' message if the installed pi version is outdated.
 - (Zed) Session history is supported in Zed starting with [`v0.225.0`](https://zed.dev/releases/preview/0.225.0). Session loading / history maps to pi's session files. Sessions can be resumed both in `pi` and in the ACP client.
 

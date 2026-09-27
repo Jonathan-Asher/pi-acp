@@ -29,6 +29,8 @@ function stripAnsi(s: string): string {
 
 type PiRpcCommand =
   | { type: 'prompt'; id?: string; message: string; images?: unknown[] }
+  | { type: 'steer'; id?: string; message: string; images?: unknown[] }
+  | { type: 'clear_queue'; id?: string }
   | { type: 'abort'; id?: string }
   | { type: 'get_state'; id?: string }
   // Model
@@ -237,6 +239,26 @@ export class PiRpcProcess {
   async prompt(message: string, images: unknown[] = []): Promise<void> {
     const res = await this.request({ type: 'prompt', message, images })
     if (!res.success) throw new Error(`pi prompt failed: ${res.error ?? JSON.stringify(res.data)}`)
+  }
+
+  /**
+   * Queue a steering message for the running agent. pi delivers it after the
+   * current assistant turn's tool calls, before the next LLM call. If the agent
+   * is idle, pi parks it in the queue until something continues the agent.
+   */
+  async steer(message: string, images: unknown[] = []): Promise<void> {
+    const res = await this.request({ type: 'steer', message, images })
+    if (!res.success) throw new Error(`pi steer failed: ${res.error ?? JSON.stringify(res.data)}`)
+  }
+
+  /** Remove every queued steering and follow-up message and return their text. */
+  async clearQueue(): Promise<{ steering: string[]; followUp: string[] }> {
+    const res = await this.request({ type: 'clear_queue' })
+    if (!res.success) throw new Error(`pi clear_queue failed: ${res.error ?? JSON.stringify(res.data)}`)
+    const data = (res.data ?? {}) as { steering?: unknown; followUp?: unknown }
+    const strings = (v: unknown): string[] =>
+      Array.isArray(v) ? v.filter((x): x is string => typeof x === 'string') : []
+    return { steering: strings(data.steering), followUp: strings(data.followUp) }
   }
 
   async abort(): Promise<void> {

@@ -43,10 +43,44 @@ export class FakePiRpcProcess {
 
   async prompt(message: string, attachments: unknown[] = []): Promise<void> {
     this.prompts.push({ message, attachments })
+    if (this.promptError) throw this.promptError
   }
 
   async abort(): Promise<void> {
     this.abortCount += 1
+  }
+
+  // Steering: a stand-in for pi's steering queue (`_steeringMessages`), which pi
+  // reports through `queue_update` events.
+  readonly steers: Array<{ message: string; images: unknown[] }> = []
+  steeringQueue: string[] = []
+  clearQueueCount = 0
+  // Holds a `steer` command "on the wire" until resolved, to model the turn-end race.
+  steerGate: Promise<void> | null = null
+  steerError: Error | null = null
+  promptError: Error | null = null
+
+  async steer(message: string, images: unknown[] = []): Promise<void> {
+    this.steers.push({ message, images })
+    if (this.steerGate) await this.steerGate
+    if (this.steerError) throw this.steerError
+    this.steeringQueue.push(message)
+    this.emit({ type: 'queue_update', steering: [...this.steeringQueue], followUp: [] })
+  }
+
+  async clearQueue(): Promise<{ steering: string[]; followUp: string[] }> {
+    this.clearQueueCount += 1
+    const steering = this.steeringQueue.splice(0, this.steeringQueue.length)
+    this.emit({ type: 'queue_update', steering: [], followUp: [] })
+    return { steering, followUp: [] }
+  }
+
+  /** pi's agent loop turns the next queued steering message into a user message. */
+  deliverSteer(): string | undefined {
+    const text = this.steeringQueue.shift()
+    this.emit({ type: 'queue_update', steering: [...this.steeringQueue], followUp: [] })
+    this.emit({ type: 'message_start', message: { role: 'user', content: [{ type: 'text', text }] } })
+    return text
   }
 
   async sendExtensionUiResponse(response: unknown): Promise<void> {

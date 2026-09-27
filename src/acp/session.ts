@@ -38,6 +38,34 @@ type SessionCreateParams = {
 
 export type StopReason = 'end_turn' | 'cancelled' | 'error'
 
+/**
+ * How `_session/steering` disposed of a message (the wire `outcome`):
+ * - `injected`: pushed into the running turn. The owning `session/prompt` stays in
+ *   flight until pi has processed it.
+ * - `promptRequired`: no turn was running (or it was ending) and the client opted
+ *   into `idleBehavior: "promptRequired"`. Nothing was consumed; the client
+ *   resubmits the message as a normal `session/prompt`.
+ * - `startedNewTurn`: no turn was running and the client did not opt in, so the
+ *   message was started as a turn of its own (the protocol default).
+ */
+export type SteerOutcome = 'injected' | 'promptRequired' | 'startedNewTurn'
+
+type QueuedMessage = { text: string; images: unknown[] }
+
+function stringList(value: unknown): string[] {
+  return Array.isArray(value) ? value.filter((v): v is string => typeof v === 'string') : []
+}
+
+function userMessageText(message: unknown): string {
+  const content = (message as any)?.content
+  if (typeof content === 'string') return content
+  if (!Array.isArray(content)) return ''
+  return content
+    .filter((c: any) => c?.type === 'text' && typeof c.text === 'string')
+    .map((c: any) => c.text as string)
+    .join('')
+}
+
 type PendingTurn = {
   resolve: (reason: StopReason) => void
   reject: (err: unknown) => void
@@ -284,6 +312,21 @@ export class PiAcpSession {
   // completes only when `agent_settled` is emitted.
   private inAgentLoop = false
 
+  // Steering (`_session/steering`). pi's own steering and follow-up queues, as of
+  // its last `queue_update`: a steered message leaves the queue when the agent loop
+  // turns it into a user message. Anything still queued when pi settles was parked
+  // by the turn-end race and is handled in `settleTurn()`.
+  private piSteeringQueue: string[] = []
+  private piFollowUpQueue: string[] = []
+  // Images of the messages we steered, keyed by the text pi reports in its queue.
+  // `clear_queue` only returns text, so re-sending a parked message needs them.
+  private steeredImages = new Map<string, unknown[][]>()
+  // `steer` requests sent to pi that it has not acknowledged yet.
+  private readonly inflightSteers = new Set<Promise<void>>()
+  // Set from pi's `agent_settled` until the ACP turn is either resolved or
+  // continued. New steering is refused in that window.
+  private settling = false
+
   // For ACP diff support: capture file contents before edit/write mutations,
   // then emit ToolCallContent {type:"diff"}. Compatible structured edit/write
   // events may need to be implemented in pi in the future.
@@ -382,6 +425,160 @@ export class PiAcpSession {
     return turnPromise
   }
 
+  /**
+   * Steer the running turn (`_session/steering`): queue the message in pi, which
+   * delivers it after the current assistant turn's tool calls, before the next LLM
+   * call. The turn's `session/prompt` resolves only once pi settles, so it stays in
+   * flight across the steered work.
+   */
+  async steer(message: string, images: unknown[] = [], opts: { promptRequired?: boolean } = {}): Promise<SteerOutcome> {
+    if (!this.canSteer()) {
+      if (opts.promptRequired) return 'promptRequired'
+      void this.prompt(message, images).catch(() => {})
+      return 'startedNewTurn'
+    }
+
+    const text = expandSlashCommand(message, this.fileCommands)
+    this.rememberSteeredImages(text, images)
+    const sent = this.proc.steer(text, images)
+    const tracked = sent.then(
+      () => undefined,
+      () => undefined
+    )
+    this.inflightSteers.add(tracked)
+    try {
+      await sent
+    } catch (err) {
+      // pi refused the message before queueing it (it rejects extension commands,
+      // which only run through `prompt`), so nothing was consumed.
+      this.takeSteeredImages(text)
+      if (opts.promptRequired) return 'promptRequired'
+      throw err
+    } finally {
+      this.inflightSteers.delete(tracked)
+    }
+    return 'injected'
+  }
+
+  private canSteer(): boolean {
+    return this.pendingTurn !== null && !this.settling && !this.cancelRequested
+  }
+
+  private rememberSteeredImages(text: string, images: unknown[]): void {
+    const list = this.steeredImages.get(text) ?? []
+    list.push(images)
+    this.steeredImages.set(text, list)
+  }
+
+  private takeSteeredImages(text: string): unknown[] {
+    const list = this.steeredImages.get(text)
+    if (!list || list.length === 0) return []
+    const images = list.shift() ?? []
+    if (list.length === 0) this.steeredImages.delete(text)
+    return images
+  }
+
+  private async waitForInflightSteers(): Promise<void> {
+    while (this.inflightSteers.size > 0) {
+      await Promise.all([...this.inflightSteers])
+    }
+  }
+
+  private hasQueuedPiMessages(): boolean {
+    return this.piSteeringQueue.length > 0 || this.piFollowUpQueue.length > 0
+  }
+
+  /**
+   * Pull every message out of pi's queues so it cannot surface in a later turn.
+   * Returns them in delivery order (steering first), with the images we sent.
+   */
+  private async takeQueuedPiMessages(): Promise<QueuedMessage[]> {
+    let cleared: { steering: string[]; followUp: string[] }
+    try {
+      cleared = await this.proc.clearQueue()
+    } catch {
+      return []
+    }
+    return [...cleared.steering, ...cleared.followUp].map(text => ({ text, images: this.takeSteeredImages(text) }))
+  }
+
+  /**
+   * pi settled while steered messages were still queued: the steer reached pi after
+   * its agent loop had made its last check for queued messages, so pi would park
+   * them until some later prompt. Run them now instead, as part of the same ACP
+   * turn (the `session/prompt` whose client was told `injected` keeps owning it).
+   * That is what pi itself does when a message lands a moment earlier.
+   */
+  private async continueTurnWith(messages: QueuedMessage[]): Promise<boolean> {
+    const [first, ...rest] = messages
+    if (!first) return false
+    try {
+      await this.proc.prompt(first.text, first.images)
+    } catch {
+      this.emit({
+        sessionUpdate: 'agent_message_chunk',
+        content: {
+          type: 'text',
+          text: `Could not deliver the steered message${messages.length > 1 ? 's' : ''}:\n\n${messages
+            .map(m => m.text)
+            .join('\n\n')}`
+        }
+      })
+      return false
+    }
+    for (const m of rest) {
+      this.rememberSteeredImages(m.text, m.images)
+      const sent = this.proc.steer(m.text, m.images).catch(() => {
+        this.takeSteeredImages(m.text)
+      })
+      this.inflightSteers.add(sent)
+      void sent.finally(() => this.inflightSteers.delete(sent))
+    }
+    return true
+  }
+
+  private async settleTurn(): Promise<void> {
+    try {
+      // A steer that was on its way when pi settled lands in pi's queue after the
+      // fact; wait until pi has acknowledged every one so the queue mirror is final.
+      await this.waitForInflightSteers()
+
+      if (this.pendingTurn && this.hasQueuedPiMessages()) {
+        const parked = await this.takeQueuedPiMessages()
+        if (parked.length > 0 && !this.cancelRequested) {
+          // Keep the ACP turn open; pi's next `agent_settled` settles it.
+          if (await this.continueTurnWith(parked)) return
+        }
+      }
+
+      // Ensure all updates derived from pi events are delivered before we resolve
+      // the ACP `session/prompt` request.
+      await this.flushEmits()
+      const reason: StopReason = this.cancelRequested ? 'cancelled' : 'end_turn'
+      this.pendingTurn?.resolve(reason)
+      this.pendingTurn = null
+      this.inAgentLoop = false
+      this.steeredImages.clear()
+    } finally {
+      this.settling = false
+    }
+
+    // Start next queued prompt, if any.
+    const next = this.turnQueue.shift()
+    if (next) {
+      this.emit({
+        sessionUpdate: 'agent_message_chunk',
+        content: { type: 'text', text: `Starting queued message. (${this.turnQueue.length} remaining)` }
+      })
+      this.startTurn(next)
+    } else {
+      this.emit({
+        sessionUpdate: 'session_info_update',
+        _meta: { piAcp: { queueDepth: 0, running: false } }
+      })
+    }
+  }
+
   async cancel(): Promise<void> {
     // Cancel current and clear any queued prompts.
     this.cancelRequested = true
@@ -398,6 +595,13 @@ export class PiAcpSession {
         sessionUpdate: 'session_info_update',
         _meta: { piAcp: { queueDepth: 0, running: Boolean(this.pendingTurn) } }
       })
+    }
+
+    // Steered messages still waiting in pi's queue would be picked up by pi's
+    // post-abort continuation and run after the user stopped the turn.
+    if (this.pendingTurn && (this.inflightSteers.size > 0 || this.hasQueuedPiMessages())) {
+      await this.waitForInflightSteers()
+      await this.takeQueuedPiMessages()
     }
 
     // Abort the currently running turn (if any). If nothing is running, this is a no-op.
@@ -499,7 +703,14 @@ export class PiAcpSession {
     this.proc.prompt(t.message, t.images).catch(err => {
       // If the subprocess errors before we get `agent_settled`, treat as error unless cancelled.
       // Also ensure we flush any already-enqueued updates first.
-      void this.flushEmits().finally(() => {
+      void (async () => {
+        // A steer accepted before pi refused the prompt is parked in pi's queue
+        // with no run to deliver it; do not let it leak into the next turn.
+        await this.waitForInflightSteers()
+        if (this.hasQueuedPiMessages()) await this.takeQueuedPiMessages()
+        this.steeredImages.clear()
+        await this.flushEmits()
+      })().finally(() => {
         // If this looks like an auth/config issue, surface AUTH_REQUIRED so clients can offer terminal login.
         const authErr = maybeAuthRequiredError(err)
         if (authErr) {
@@ -847,29 +1058,22 @@ export class PiAcpSession {
       }
 
       case 'agent_settled': {
-        // Ensure all updates derived from pi events are delivered before we resolve
-        // the ACP `session/prompt` request.
-        void this.flushEmits().finally(() => {
-          const reason: StopReason = this.cancelRequested ? 'cancelled' : 'end_turn'
-          this.pendingTurn?.resolve(reason)
-          this.pendingTurn = null
-          this.inAgentLoop = false
+        this.inAgentLoop = false
+        this.settling = true
+        void this.settleTurn()
+        break
+      }
 
-          // Start next queued prompt, if any.
-          const next = this.turnQueue.shift()
-          if (next) {
-            this.emit({
-              sessionUpdate: 'agent_message_chunk',
-              content: { type: 'text', text: `Starting queued message. (${this.turnQueue.length} remaining)` }
-            })
-            this.startTurn(next)
-          } else {
-            this.emit({
-              sessionUpdate: 'session_info_update',
-              _meta: { piAcp: { queueDepth: 0, running: false } }
-            })
-          }
-        })
+      case 'queue_update': {
+        this.piSteeringQueue = stringList((ev as any).steering)
+        this.piFollowUpQueue = stringList((ev as any).followUp)
+        break
+      }
+
+      case 'message_start': {
+        // pi turned a queued message into a user message: it is consumed.
+        const msg = (ev as any).message
+        if (msg?.role === 'user') this.takeSteeredImages(userMessageText(msg))
         break
       }
 

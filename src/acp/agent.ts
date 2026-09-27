@@ -25,11 +25,12 @@ import {
   type ForkSessionRequest,
   type ForkSessionResponse,
   type ResumeSessionRequest,
-  type ResumeSessionResponse
+  type ResumeSessionResponse,
+  type ContentBlock
 } from '@agentclientprotocol/sdk'
 import { createHash } from 'node:crypto'
 import { getAuthMethods } from './auth.js'
-import { SessionManager, type PiAcpSession } from './session.js'
+import { SessionManager, type PiAcpSession, type SteerOutcome } from './session.js'
 import { SessionStore } from './session-store.js'
 import { PiRpcProcess } from '../pi-rpc/process.js'
 import { listPiSessions, findPiSession } from './pi-sessions.js'
@@ -55,6 +56,38 @@ import { existsSync, readFileSync, realpathSync, readdirSync, statSync, unlinkSy
 import type { AvailableCommand } from '@agentclientprotocol/sdk'
 import { join, dirname, basename } from 'node:path'
 import { spawnSync } from 'node:child_process'
+
+/**
+ * ACP steering extension: a client injects a message into the turn that is
+ * currently running instead of queueing it as a separate `session/prompt`.
+ * Advertised through the top-level `InitializeResponse._meta.steering.supported`.
+ */
+export const STEER_METHOD = '_session/steering'
+
+type SteerRequest = {
+  sessionId: string
+  prompt: ContentBlock[]
+  promptRequired: boolean
+}
+
+function parseSteerRequest(params: Record<string, unknown>): SteerRequest {
+  const { sessionId, prompt, _meta } = (params ?? {}) as {
+    sessionId?: unknown
+    prompt?: unknown
+    _meta?: { steering?: { idleBehavior?: unknown } }
+  }
+  if (typeof sessionId !== 'string' || sessionId.length === 0) {
+    throw RequestError.invalidParams(undefined, 'steer params require a non-empty sessionId')
+  }
+  if (!Array.isArray(prompt) || prompt.length === 0) {
+    throw RequestError.invalidParams(undefined, 'steer params require a non-empty prompt array')
+  }
+  const idleBehavior = _meta && typeof _meta === 'object' ? _meta.steering?.idleBehavior : undefined
+  if (idleBehavior !== undefined && idleBehavior !== 'promptRequired') {
+    throw RequestError.invalidParams(undefined, 'unsupported steering idleBehavior')
+  }
+  return { sessionId, prompt: prompt as ContentBlock[], promptRequired: idleBehavior === 'promptRequired' }
+}
 
 type ThinkingLevel = 'off' | 'minimal' | 'low' | 'medium' | 'high' | 'xhigh'
 type AdvertisedModel = {
@@ -334,8 +367,38 @@ export class PiAcpAgent implements ACPAgent {
           fork: {},
           resume: {}
         }
+      },
+      // Top-level `_meta` (sibling of `agentCapabilities`), per the ACP steering
+      // extension: clients may inject a message into a running turn through
+      // `_session/steering`.
+      _meta: {
+        steering: { supported: true }
       }
     }
+  }
+
+  async extMethod(method: string, params: Record<string, unknown>): Promise<Record<string, unknown>> {
+    if (method === STEER_METHOD) return this.steer(parseSteerRequest(params))
+    throw RequestError.methodNotFound(method)
+  }
+
+  /**
+   * `_session/steering`. While a turn runs, the message goes into pi's steering
+   * queue (`injected`); pi delivers it after the current tool calls and the turn's
+   * `session/prompt` resolves only after that. With no running turn, a client that
+   * opted into `idleBehavior: "promptRequired"` gets the message back untouched
+   * (`promptRequired`); otherwise it runs as a new turn (`startedNewTurn`).
+   */
+  private async steer(req: SteerRequest): Promise<{ outcome: SteerOutcome; reason?: string }> {
+    let session = this.sessions.maybeGet(req.sessionId)
+    if (!session) {
+      // Not loaded, so nothing can be running.
+      if (req.promptRequired) return { outcome: 'promptRequired', reason: 'noRunningTurn' }
+      session = await this.restoreSession(req.sessionId)
+    }
+    const { message, images } = promptToPiMessage(req.prompt)
+    const outcome = await session.steer(message, images, { promptRequired: req.promptRequired })
+    return outcome === 'promptRequired' ? { outcome, reason: 'noRunningTurn' } : { outcome }
   }
 
   async newSession(params: NewSessionRequest) {
