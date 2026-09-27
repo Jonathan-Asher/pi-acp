@@ -66,7 +66,7 @@ child.stdout.on('data', chunk => {
       updates.push({ at: Date.now(), u })
       for (const l of listeners) l(u)
     } else if (msg.id != null && msg.method) {
-      // Client-side requests (permissions etc.): allow once.
+      // Client-side requests (permissions etc.): decline; the smoke prompt needs none.
       child.stdin.write(
         `${JSON.stringify({ jsonrpc: '2.0', id: msg.id, result: { outcome: { outcome: 'cancelled' } } })}\n`
       )
