@@ -160,7 +160,7 @@ Loaded from:
 Other built-in commands:
 
 - `/model` - not implemented (use the model selector UI in Zed)
-- `/thinking` - maps to 'mode' selector in Zed
+- `/thinking` - maps to 'mode' selector in Zed. The selector lists only the levels the current model supports (pi's `thinkingLevelMap`, including `max`) and updates when the model changes
 - `/clear` - not implemented (use ACP client 'new' command)
 
 #### 3) Skill commands

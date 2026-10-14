@@ -1,6 +1,6 @@
 {
   "name": "pi-acp",
-  "version": "0.0.34-steering.1",
+  "version": "0.0.34-steering.2",
   "description": "ACP adapter for pi coding agent",
   "license": "MIT",
   "author": "Sergii Kozak <svkozak@gmail.com>",

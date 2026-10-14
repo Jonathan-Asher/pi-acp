@@ -28,6 +28,12 @@ import {
   type ResumeSessionResponse,
   type ContentBlock
 } from '@agentclientprotocol/sdk'
+import {
+  PI_THINKING_LEVELS,
+  isThinkingLevel,
+  normalizeReportedLevels,
+  thinkingLevelsForModel
+} from './thinking-levels.js'
 import { createHash } from 'node:crypto'
 import { getAuthMethods } from './auth.js'
 import { SessionManager, type PiAcpSession, type SteerOutcome } from './session.js'
@@ -89,7 +95,6 @@ function parseSteerRequest(params: Record<string, unknown>): SteerRequest {
   return { sessionId, prompt: prompt as ContentBlock[], promptRequired: idleBehavior === 'promptRequired' }
 }
 
-type ThinkingLevel = 'off' | 'minimal' | 'low' | 'medium' | 'high' | 'xhigh'
 type AdvertisedModel = {
   modelId: string
   name: string
@@ -200,7 +205,7 @@ async function resolveForkEntryId(
   let userOrdinal = -1
   for (let i = targetIdx + 1; i < texts.length; i++) {
     if (texts[i]!.role !== 'user') continue
-    userOrdinal = texts.slice(0, i).filter((t) => t.role === 'user').length
+    userOrdinal = texts.slice(0, i).filter(t => t.role === 'user').length
     break
   }
   if (userOrdinal === -1) return undefined // reply is the tail
@@ -1417,20 +1422,39 @@ export class PiAcpAgent implements ACPAgent {
       throw RequestError.invalidParams(`Unknown modeId: ${mode}`)
     }
 
-    await session.proc.setThinkingLevel(mode)
+    await this.applyThinkingLevel(session.sessionId, session.proc, mode)
 
-    // Let the client know the current mode changed (keeps the dropdown in sync).
+    return {}
+  }
+
+  // pi clamps a level the current model does not support to its nearest supported one, so the
+  // level reported back (and shown in the dropdown) is pi's effective level, not the requested one.
+  private async applyThinkingLevel(
+    sessionId: string,
+    proc: PiRpcProcess,
+    level: string
+  ): Promise<SessionConfigOption[]> {
+    await proc.setThinkingLevel(level)
+
+    const { configOptions, modes } = await getSessionConfiguration(proc)
+
     void this.conn.sessionUpdate({
-      sessionId: session.sessionId,
+      sessionId,
       update: {
         sessionUpdate: 'current_mode_update',
-        currentModeId: mode
+        currentModeId: modes.currentModeId
       }
     })
 
-    await emitConfigOptionsUpdate(this.conn, session.sessionId, session.proc)
+    await this.conn.sessionUpdate({
+      sessionId,
+      update: {
+        sessionUpdate: 'config_option_update',
+        configOptions
+      }
+    })
 
-    return {}
+    return configOptions
   }
 
   async setSessionConfigOption(params: SetSessionConfigOptionRequest): Promise<SetSessionConfigOptionResponse> {
@@ -1448,15 +1472,8 @@ export class PiAcpAgent implements ACPAgent {
         throw RequestError.invalidParams(`Unknown thinking level: ${params.value}`)
       }
 
-      await session.proc.setThinkingLevel(params.value)
-
-      void this.conn.sessionUpdate({
-        sessionId: session.sessionId,
-        update: {
-          sessionUpdate: 'current_mode_update',
-          currentModeId: params.value
-        }
-      })
+      const configOptions = await this.applyThinkingLevel(session.sessionId, session.proc, params.value)
+      return { configOptions }
     } else {
       throw RequestError.invalidParams(`Unknown config option: ${configId}`)
     }
@@ -1464,10 +1481,6 @@ export class PiAcpAgent implements ACPAgent {
     const configOptions = await emitConfigOptionsUpdate(this.conn, session.sessionId, session.proc)
     return { configOptions }
   }
-}
-
-function isThinkingLevel(x: string): x is ThinkingLevel {
-  return x === 'off' || x === 'minimal' || x === 'low' || x === 'medium' || x === 'high' || x === 'xhigh'
 }
 
 async function getThinkingState(
@@ -1481,9 +1494,6 @@ async function getThinkingState(
   }>
   currentModeId: string
 }> {
-  // Ask pi for current thinking level.
-  let current: ThinkingLevel = 'medium'
-
   const state =
     pre?.state ??
     (await (async () => {
@@ -1494,10 +1504,27 @@ async function getThinkingState(
       }
     })())
 
-  const tl = typeof state?.thinkingLevel === 'string' ? state.thinkingLevel : null
-  if (tl && isThinkingLevel(tl)) current = tl
+  // The current model's own levels: pi hides levels a model's thinkingLevelMap marks unsupported
+  // and only offers xhigh/max where the map declares them.
+  const reported = await (async () => {
+    try {
+      return normalizeReportedLevels(await proc.getAvailableThinkingLevels())
+    } catch {
+      return null
+    }
+  })()
+  const available: string[] = reported ?? thinkingLevelsForModel(state?.model) ?? [...PI_THINKING_LEVELS]
 
-  const available: ThinkingLevel[] = ['off', 'minimal', 'low', 'medium', 'high', 'xhigh']
+  const tl = typeof state?.thinkingLevel === 'string' ? state.thinkingLevel.trim() : ''
+  const current = tl || (available.includes('medium') ? 'medium' : (available[0] ?? 'off'))
+  if (!available.includes(current)) {
+    const rank = (level: string) => {
+      const i = (PI_THINKING_LEVELS as readonly string[]).indexOf(level)
+      return i === -1 ? PI_THINKING_LEVELS.length : i
+    }
+    available.push(current)
+    available.sort((a, b) => rank(a) - rank(b))
+  }
 
   return {
     currentModeId: current,
