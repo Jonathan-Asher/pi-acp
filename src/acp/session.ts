@@ -26,7 +26,7 @@ import {
   bashTerminalOutputMeta,
   isBashTool
 } from './translate/bash.js'
-import { toolResultToText } from './translate/pi-tools.js'
+import { toolResultImages, toolResultToText, withoutImageData } from './translate/pi-tools.js'
 
 type SessionCreateParams = {
   cwd: string
@@ -977,12 +977,17 @@ export class PiAcpSession {
           content = [{ type: 'content', content: { type: 'text', text } }] satisfies ToolCallContent[]
         }
 
+        // Pictures a tool returned (e.g. `read` of an image) go as image
+        // content, so the client can show them while the turn runs.
+        const images = toolResultImages(result)
+        if (images.length) content = [...(content ?? []), ...images]
+
         this.emit({
           sessionUpdate: 'tool_call_update',
           toolCallId,
           status: isError ? 'failed' : 'completed',
           content,
-          ...(hasStructuredDiff ? {} : { rawOutput: result })
+          ...(hasStructuredDiff ? {} : { rawOutput: withoutImageData(result) })
         })
 
         this.cleanupToolCall(toolCallId)

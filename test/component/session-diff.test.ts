@@ -212,3 +212,33 @@ test('PiAcpSession: emits write diff content for new files on completion', async
   assert.equal(diff.oldText, null)
   assert.equal(diff.newText, 'created\n')
 })
+
+test('PiAcpSession: sends a tool result image as image content, without its bytes in rawOutput', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'pi-acp-image-'))
+  const { conn, proc } = createSession(dir)
+
+  proc.emit({ type: 'tool_execution_start', toolCallId: 't1', toolName: 'read', args: { path: 'shot.png' } })
+  proc.emit({
+    type: 'tool_execution_end',
+    toolCallId: 't1',
+    isError: false,
+    result: {
+      content: [
+        { type: 'text', text: 'Read image file [image/png]' },
+        { type: 'image', data: 'iVBORw0KGgo=', mimeType: 'image/png' }
+      ]
+    }
+  })
+
+  await new Promise(r => setTimeout(r, 0))
+
+  const end = completedToolUpdate(conn)
+  assert.ok(end, 'expected completed tool_call_update')
+  const content = (end.update as any).content as any[]
+  assert.deepEqual(content.at(-1), {
+    type: 'content',
+    content: { type: 'image', data: 'iVBORw0KGgo=', mimeType: 'image/png' }
+  })
+  assert.equal(content[0].content.text, 'Read image file [image/png]')
+  assert.deepEqual((end.update as any).rawOutput.content[1], { type: 'image', mimeType: 'image/png' })
+})

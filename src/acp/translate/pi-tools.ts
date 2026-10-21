@@ -1,3 +1,30 @@
+import type { ToolCallContent } from '@agentclientprotocol/sdk'
+
+/**
+ * The images in a pi tool result (its `ImageContent` blocks, e.g. what `read`
+ * returns for a picture), as ACP tool-call content.
+ */
+export function toolResultImages(result: unknown): ToolCallContent[] {
+  const content = (result as any)?.content
+  if (!Array.isArray(content)) return []
+  return content
+    .filter((c: any) => c?.type === 'image' && typeof c.data === 'string' && c.data && typeof c.mimeType === 'string')
+    .map((c: any) => ({ type: 'content', content: { type: 'image', data: c.data, mimeType: c.mimeType } }))
+}
+
+/**
+ * `result` without its image data — what goes in `rawOutput` once the images
+ * travel as tool-call content, so a picture is not sent twice.
+ */
+export function withoutImageData(result: unknown): unknown {
+  const content = (result as any)?.content
+  if (!Array.isArray(content) || !content.some((c: any) => c?.type === 'image')) return result
+  return {
+    ...(result as object),
+    content: content.map((c: any) => (c?.type === 'image' ? { type: 'image', mimeType: c.mimeType } : c))
+  }
+}
+
 export function toolResultToText(result: unknown): string {
   if (!result) return ''
 
@@ -42,6 +69,9 @@ export function toolResultToText(result: unknown): string {
     if (typeof exitCode === 'number') parts.push(`exit code: ${exitCode}`)
     return parts.join('\n\n').trimEnd()
   }
+
+  // An image-only result has no text to show; never dump its base64.
+  if (toolResultImages(result).length) return ''
 
   try {
     return JSON.stringify(result, null, 2)
