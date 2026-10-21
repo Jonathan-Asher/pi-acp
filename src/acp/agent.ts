@@ -34,7 +34,6 @@ import {
   normalizeReportedLevels,
   thinkingLevelsForModel
 } from './thinking-levels.js'
-import { createHash } from 'node:crypto'
 import { getAuthMethods } from './auth.js'
 import { SessionManager, type PiAcpSession, type SteerOutcome } from './session.js'
 import { SessionStore } from './session-store.js'
@@ -42,6 +41,7 @@ import { PiRpcProcess } from '../pi-rpc/process.js'
 import { listPiSessions, findPiSession } from './pi-sessions.js'
 import { normalizePiAssistantText, normalizePiMessageText } from './translate/pi-messages.js'
 import { toolResultToText } from './translate/pi-tools.js'
+import { forkSessionFile, ForkPointError, type ForkPoint, type ForkedSessionFile } from './session-fork.js'
 import {
   bashCommand,
   bashExitCode,
@@ -74,6 +74,23 @@ type SteerRequest = {
   sessionId: string
   prompt: ContentBlock[]
   promptRequired: boolean
+}
+
+/**
+ * The fork point of a `session/fork` request (`_meta["jetbrains.air.fork"]`),
+ * or undefined for a tail fork. A block that names nothing usable is still a
+ * fork point — one that resolves to nothing and is refused.
+ */
+export function readForkPoint(params: unknown): ForkPoint | undefined {
+  const meta = (params as { _meta?: Record<string, unknown> } | null)?._meta
+  const air = meta?.['jetbrains.air.fork'] ?? (meta?.jetbrains as any)?.air?.fork
+  if (!air || typeof air !== 'object') return undefined
+  const raw = air as Record<string, unknown>
+  return {
+    messageId: typeof raw.messageId === 'string' ? raw.messageId : undefined,
+    messageFingerprint: typeof raw.messageFingerprint === 'string' ? raw.messageFingerprint : undefined,
+    messageOccurrence: typeof raw.messageOccurrence === 'number' ? raw.messageOccurrence : undefined
+  }
 }
 
 function parseSteerRequest(params: Record<string, unknown>): SteerRequest {
@@ -158,62 +175,6 @@ function mergeCommands(a: AvailableCommand[], b: AvailableCommand[]): AvailableC
   }
 
   return out
-}
-
-/**
- * Resolve a codeg-style ForkPoint (`sha256:<hex>` of agent message text +
- * 1-based occurrence) to the pi user-message entryId to fork from.
- *
- * pi forks from USER messages, while the fingerprint names an AGENT reply —
- * so the fork point is the first user message AFTER the matched reply. When
- * the reply is the turn tail (no following user message), returns undefined
- * → the caller falls back to a tail fork (pi `clone`). Same fallback when the
- * fingerprint matches nothing (text normalization drift, empty turn).
- */
-async function resolveForkEntryId(
-  proc: PiRpcProcess,
-  forkMeta: { messageId?: string; messageFingerprint?: string; messageOccurrence?: number }
-): Promise<string | undefined> {
-  const fingerprint = forkMeta.messageFingerprint ?? ''
-  if (!fingerprint.startsWith('sha256:')) return undefined
-  const occurrence = Math.max(1, forkMeta.messageOccurrence ?? 1)
-
-  const data = (await proc.getMessages()) as any
-  const messages: any[] = Array.isArray(data?.messages) ? data.messages : []
-  const texts = messages.map((m: any) => ({
-    role: String(m?.role ?? ''),
-    text: normalizePiAssistantText(m?.content)
-  }))
-
-  // Find the occurrence-th assistant message whose text hashes to the fingerprint.
-  let targetIdx = -1
-  let seen = 0
-  for (let i = 0; i < texts.length; i++) {
-    if (texts[i]!.role !== 'assistant') continue
-    const digest = createHash('sha256').update(texts[i]!.text, 'utf8').digest('hex')
-    if (`sha256:${digest}` === fingerprint) {
-      seen++
-      if (seen === occurrence) {
-        targetIdx = i
-        break
-      }
-    }
-  }
-  if (targetIdx === -1) return undefined
-
-  // Fork from the first user message after the matched reply.
-  let userOrdinal = -1
-  for (let i = targetIdx + 1; i < texts.length; i++) {
-    if (texts[i]!.role !== 'user') continue
-    userOrdinal = texts.slice(0, i).filter(t => t.role === 'user').length
-    break
-  }
-  if (userOrdinal === -1) return undefined // reply is the tail
-
-  const forkMsgs = await proc.getForkMessages()
-  const candidates = forkMsgs.messages ?? []
-  const entryId = candidates[userOrdinal]?.entryId
-  return typeof entryId === 'string' && entryId.length > 0 ? entryId : undefined
 }
 
 import { fileURLToPath } from 'node:url'
@@ -377,7 +338,12 @@ export class PiAcpAgent implements ACPAgent {
       // extension: clients may inject a message into a running turn through
       // `_session/steering`.
       _meta: {
-        steering: { supported: true }
+        steering: { supported: true },
+        // `session/fork` lands exactly on the named reply or refuses with
+        // `invalid_params` (`strict`), and forks from the session file without
+        // opening the source in pi, so a session with a turn in flight can be
+        // forked from another process (`whileRunning`).
+        forkPoint: { strict: true, whileRunning: true }
       }
     }
   }
@@ -1285,19 +1251,23 @@ export class PiAcpAgent implements ACPAgent {
    *
    * Clients describe the fork point via `_meta["jetbrains.air.fork"]`
    * (`ForkPoint` convention shared by codeg/claude-agent-acp/codex-acp):
-   * `messageId`, optional `messageFingerprint` (`sha256:<hex>` of the agent
-   * message text) and optional `messageOccurrence` (1-based index among agent
-   * messages sharing the fingerprint). Absent or unresolvable → fork at the
-   * tail (pi `clone`), which is the convention's documented fallback.
+   * `messageId` (for pi, the session entry id of an assistant message),
+   * optional `messageFingerprint` (`sha256:<hex>` of the agent message text)
+   * and optional `messageOccurrence` (1-based index among agent messages
+   * sharing the fingerprint). No fork point forks at the tail, like pi's
+   * `clone`. A fork point that names nothing is refused with
+   * `invalid_params` rather than forked somewhere else, so a client can build
+   * "edit this message" on it.
    *
-   * pi forks FROM a user message, so a fingerprint naming an agent reply
-   * resolves to the user message that FOLLOWS that reply. If the reply is the
-   * turn tail, the fork is the tail (clone).
+   * The fork is EXACT: it ends with the named reply and what belongs to it
+   * (its tool results, settings changes written before the next message),
+   * not at the end of that reply's turn. It is written from the session file
+   * directly (`session-fork.ts`) and never opens the source in a pi process,
+   * so the source session may be running a turn — in this process or another
+   * — while it is forked.
    *
-   * Returns the NEW sessionId. The original session keeps its own history and
-   * stays usable: it is re-bound to a fresh pi subprocess on the old session
-   * file, while the forked session inherits the live subprocess (which pi
-   * already switched onto the forked branch).
+   * Returns the NEW sessionId, backed by its own pi subprocess; the source
+   * session is left untouched.
    */
   async unstable_forkSession(params: ForkSessionRequest): Promise<ForkSessionResponse> {
     if (!isAbsolute(params.cwd)) {
@@ -1309,77 +1279,30 @@ export class PiAcpAgent implements ACPAgent {
       throw RequestError.invalidParams(`Unknown sessionId: ${params.sessionId}`)
     }
 
-    const session = await this.restoreSession(params.sessionId, {
+    let forked: ForkedSessionFile
+    try {
+      forked = forkSessionFile({
+        sessionFile: stored.sessionFile,
+        point: readForkPoint(params),
+        cwd: params.cwd
+      })
+    } catch (e: any) {
+      if (e instanceof ForkPointError) throw RequestError.invalidParams(e.message)
+      throw RequestError.internalError({}, `pi fork failed: ${String(e?.message ?? e)}`)
+    }
+
+    this.store.upsert({ sessionId: forked.sessionId, cwd: params.cwd, sessionFile: forked.sessionFile })
+    const forkedSession = await this.restoreSession(forked.sessionId, {
       cwd: params.cwd,
       mcpServers: params.mcpServers
     })
-    const proc = session.proc
-
-    const forkMeta = (params as any)?._meta?.jetbrains?.air?.fork as
-      | { messageId?: string; messageFingerprint?: string; messageOccurrence?: number }
-      | undefined
-
-    // Resolve the fork point to a pi user-message entryId, if possible.
-    let entryId: string | undefined
-    if (forkMeta?.messageFingerprint) {
-      entryId = await resolveForkEntryId(proc, forkMeta)
-    }
-
-    if (entryId) {
-      const res = await proc.forkSession(entryId)
-      if (res.cancelled) {
-        throw RequestError.internalError({}, 'pi fork cancelled by a session_before_fork handler')
-      }
-    } else {
-      // Tail fork: duplicate the active branch at the current position.
-      const res = await proc.cloneSession()
-      if (res.cancelled) {
-        throw RequestError.internalError({}, 'pi clone cancelled by a session_before_fork handler')
-      }
-    }
-
-    // pi switched this subprocess onto the forked session.
-    const state = (await proc.getState()) as any
-    const newSessionId = typeof state?.sessionId === 'string' ? state.sessionId : crypto.randomUUID()
-    const newSessionFile = typeof state?.sessionFile === 'string' ? state.sessionFile : null
-    if (newSessionFile && newSessionFile === stored.sessionFile) {
-      throw RequestError.internalError({}, 'pi fork did not switch to a new session file')
-    }
-
-    // Hand the live subprocess to the forked session.
-    const forkedSession = this.sessions.getOrCreate(newSessionId, {
-      cwd: params.cwd,
-      mcpServers: params.mcpServers ?? [],
-      conn: this.conn,
-      proc,
-      fileCommands: loadSlashCommands(params.cwd)
-    })
-    if (newSessionFile) {
-      this.store.upsert({ sessionId: newSessionId, cwd: params.cwd, sessionFile: newSessionFile })
-    }
-
-    // Give the ORIGINAL session a fresh subprocess on its own file so both
-    // sides stay usable independently.
-    if (stored.sessionFile) {
-      try {
-        const freshProc = await PiRpcProcess.spawn({
-          cwd: params.cwd,
-          sessionPath: stored.sessionFile,
-          piCommand: process.env.PI_ACP_PI_COMMAND
-        })
-        session.swapProc(freshProc)
-      } catch {
-        // The original session keeps the (now forked) subprocess; it will
-        // recover on the next session/load.
-      }
-    }
 
     const { modes, configOptions } = await getSessionConfiguration(forkedSession.proc).catch(() => ({
       modes: undefined,
       configOptions: undefined
     }))
 
-    return { sessionId: newSessionId, modes, configOptions }
+    return { sessionId: forked.sessionId, modes, configOptions }
   }
 
   async deleteSession(params: DeleteSessionRequest): Promise<DeleteSessionResponse> {
