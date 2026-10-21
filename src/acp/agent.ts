@@ -81,6 +81,17 @@ type SteerRequest = {
  * or undefined for a tail fork. A block that names nothing usable is still a
  * fork point — one that resolves to nothing and is refused.
  */
+/**
+ * The display name a client asks the session to run under
+ * (`_meta.piAcp.sessionName` on `session/new`, `load` or `resume`) — codeg
+ * passes the conversation's title. pi keeps it as the session's name
+ * (`set_session_name`), which its session lists and `/resume` show.
+ */
+export function readSessionName(params: unknown): string | undefined {
+  const name = (params as { _meta?: { piAcp?: { sessionName?: unknown } } } | null)?._meta?.piAcp?.sessionName
+  return typeof name === 'string' && name.trim() ? name.trim() : undefined
+}
+
 export function readForkPoint(params: unknown): ForkPoint | undefined {
   const meta = (params as { _meta?: Record<string, unknown> } | null)?._meta
   const air = meta?.['jetbrains.air.fork'] ?? (meta?.jetbrains as any)?.air?.fork
@@ -175,6 +186,26 @@ function mergeCommands(a: AvailableCommand[], b: AvailableCommand[]): AvailableC
   }
 
   return out
+}
+
+/**
+ * Name the session as the client asked ({@link readSessionName}), unless it is
+ * already called that: every rename appends an entry to the session file.
+ * Best effort — a pi without `set_session_name` keeps its own name.
+ */
+export async function applySessionName(
+  session: { proc: { getState(): Promise<unknown>; setSessionName(name: string): Promise<void> } },
+  params: unknown
+): Promise<void> {
+  const name = readSessionName(params)
+  if (!name) return
+  try {
+    const state = (await session.proc.getState()) as { sessionName?: unknown } | null
+    if (state?.sessionName === name) return
+    await session.proc.setSessionName(name)
+  } catch {
+    // keep pi's own name
+  }
 }
 
 import { fileURLToPath } from 'node:url'
@@ -390,6 +421,7 @@ export class PiAcpAgent implements ACPAgent {
       fileCommands,
       piCommand: process.env.PI_ACP_PI_COMMAND
     })
+    await applySessionName(session, params)
 
     // Fetch state + models once (parallel) to reduce startup latency.
     let state: any = null
@@ -1052,6 +1084,7 @@ export class PiAcpAgent implements ACPAgent {
       cwd: params.cwd,
       mcpServers: params.mcpServers
     })
+    await applySessionName(session, params)
     const proc = session.proc
     const fileCommands = loadSlashCommands(params.cwd)
 
@@ -1234,7 +1267,7 @@ export class PiAcpAgent implements ACPAgent {
       cwd: params.cwd,
       mcpServers: params.mcpServers
     })
-
+    await applySessionName(session, params)
     ;(this.sessions as any).closeAllExcept?.(session.sessionId)
     this.store.upsert({ sessionId: params.sessionId, cwd: params.cwd, sessionFile: stored.sessionFile })
 
