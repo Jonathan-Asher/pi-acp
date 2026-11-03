@@ -240,7 +240,7 @@ test('steer: a steer accepted before pi refuses the prompt does not leak into th
   assert.equal(await session.steer('note', [], { promptRequired: true }), 'injected')
   rejectPrompt(new Error('pi prompt failed: no model'))
 
-  assert.equal(await turn, 'error')
+  await assert.rejects(turn, /pi prompt failed: no model/)
   assert.equal(proc.clearQueueCount, 1)
   assert.deepEqual(proc.steeringQueue, [])
 })

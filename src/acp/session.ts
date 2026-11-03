@@ -4,6 +4,7 @@ import type {
   McpServer,
   PermissionOption,
   SessionUpdate,
+  StopReason,
   ToolCallContent,
   ToolCallLocation,
   ToolKind
@@ -14,6 +15,7 @@ import { isAbsolute, resolve as resolvePath } from 'node:path'
 import { PiRpcProcess, PiRpcSpawnError, type PiRpcEvent } from '../pi-rpc/process.js'
 import { maybeAuthRequiredError } from './auth-required.js'
 import { SessionStore } from './session-store.js'
+import { assistantStopOf, piStopError, turnOutcome, type PiAssistantStop } from './stop-reason.js'
 import { expandSlashCommand, type FileSlashCommand } from './slash-commands.js'
 import {
   bashCommand,
@@ -36,7 +38,7 @@ type SessionCreateParams = {
   piCommand?: string
 }
 
-export type StopReason = 'end_turn' | 'cancelled' | 'error'
+export type { StopReason }
 
 /**
  * How `_session/steering` disposed of a message (the wire `outcome`):
@@ -312,6 +314,11 @@ export class PiAcpSession {
   // completes only when `agent_settled` is emitted.
   private inAgentLoop = false
 
+  // How the current turn's latest assistant message stopped. Retries, overflow
+  // recovery and steered continuations each add a newer one, so the value at
+  // `agent_settled` is the run's final outcome.
+  private lastAssistantStop: PiAssistantStop | null = null
+
   // Steering (`_session/steering`). pi's own steering and follow-up queues, as of
   // its last `queue_update`: a steered message leaves the queue when the agent loop
   // turns it into a user message. Anything still queued when pi settles was parked
@@ -554,8 +561,9 @@ export class PiAcpSession {
       // Ensure all updates derived from pi events are delivered before we resolve
       // the ACP `session/prompt` request.
       await this.flushEmits()
-      const reason: StopReason = this.cancelRequested ? 'cancelled' : 'end_turn'
-      this.pendingTurn?.resolve(reason)
+      const outcome = turnOutcome(this.lastAssistantStop, this.cancelRequested)
+      if ('error' in outcome) this.pendingTurn?.reject(outcome.error)
+      else this.pendingTurn?.resolve(outcome.stopReason)
       this.pendingTurn = null
       this.inAgentLoop = false
       this.steeredImages.clear()
@@ -688,6 +696,7 @@ export class PiAcpSession {
   private startTurn(t: QueuedTurn): void {
     this.cancelRequested = false
     this.inAgentLoop = false
+    this.lastAssistantStop = null
 
     this.pendingTurn = { resolve: t.resolve, reject: t.reject }
 
@@ -715,9 +724,11 @@ export class PiAcpSession {
         const authErr = maybeAuthRequiredError(err)
         if (authErr) {
           this.pendingTurn?.reject(authErr)
+        } else if (this.cancelRequested) {
+          this.pendingTurn?.resolve('cancelled')
         } else {
-          const reason: StopReason = this.cancelRequested ? 'cancelled' : 'error'
-          this.pendingTurn?.resolve(reason)
+          // pi refused the prompt or exited before taking it: tell the client why.
+          this.pendingTurn?.reject(piStopError(String((err as any)?.message ?? err)))
         }
 
         this.pendingTurn = null
@@ -1079,6 +1090,12 @@ export class PiAcpSession {
         // pi turned a queued message into a user message: it is consumed.
         const msg = (ev as any).message
         if (msg?.role === 'user') this.takeSteeredImages(userMessageText(msg))
+        break
+      }
+
+      case 'message_end': {
+        const stop = assistantStopOf((ev as any).message)
+        if (stop && this.pendingTurn) this.lastAssistantStop = stop
         break
       }
 
