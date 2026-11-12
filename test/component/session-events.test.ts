@@ -410,11 +410,15 @@ test('PiAcpSession: emits agent_message_chunk for auto_compaction_start', async 
 
   await new Promise(r => setTimeout(r, 0))
 
-  assert.equal(conn.updates.length, 1)
+  // The sentence clients know, then the structured record (_meta.piAcp.compaction).
+  assert.equal(conn.updates.length, 2)
   assert.deepEqual(conn.updates[0]!.update, {
     sessionUpdate: 'agent_message_chunk',
     content: { type: 'text', text: 'Context nearing limit, running automatic compaction...' }
   })
+  const compaction = (conn.updates[1]!.update as any)._meta.piAcp.compaction
+  assert.equal(compaction.status, 'in_progress')
+  assert.equal(compaction.reason, 'threshold')
 })
 
 test('PiAcpSession: emits agent_message_chunk for auto_compaction_end', async () => {
@@ -434,7 +438,7 @@ test('PiAcpSession: emits agent_message_chunk for auto_compaction_end', async ()
 
   await new Promise(r => setTimeout(r, 0))
 
-  assert.equal(conn.updates.length, 1)
+  assert.equal(conn.updates.length, 2)
   assert.deepEqual(conn.updates[0]!.update, {
     sessionUpdate: 'agent_message_chunk',
     content: {
@@ -442,6 +446,7 @@ test('PiAcpSession: emits agent_message_chunk for auto_compaction_end', async ()
       text: 'Automatic compaction finished; context was summarized to continue the session.'
     }
   })
+  assert.equal((conn.updates[1]!.update as any)._meta.piAcp.compaction.status, 'completed')
 })
 
 test('PiAcpSession: preserves ordering when auto_retry_start is interleaved with text_delta events', async () => {

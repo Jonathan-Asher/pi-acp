@@ -1,8 +1,59 @@
 import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process'
 import { mkdirSync } from 'node:fs'
-import * as readline from 'node:readline'
+import { StringDecoder } from 'node:string_decoder'
 import { getPiCommand, shouldUseShellForPiCommand } from './command.js'
 import { piChildEnv, SUBAGENTS_TEMP_ROOT_ENV } from './env.js'
+
+/**
+ * Splits pi's stdout into JSONL records on LF only, as pi's RPC docs require.
+ * Node's `readline` also breaks lines at U+2028 / U+2029, which are valid
+ * inside JSON strings (web pages and model output contain them), so a record
+ * carrying one would be torn in two and both halves dropped as unparseable.
+ */
+export class JsonlLineSplitter {
+  private readonly decoder = new StringDecoder('utf8')
+  private buffer = ''
+  private scanned = 0
+
+  constructor(private readonly onLine: (line: string) => void) {}
+
+  push(chunk: Buffer | string): void {
+    this.buffer += typeof chunk === 'string' ? chunk : this.decoder.write(chunk)
+    let start = 0
+    let nl = this.buffer.indexOf('\n', this.scanned)
+    while (nl !== -1) {
+      this.emit(this.buffer.slice(start, nl))
+      start = nl + 1
+      nl = this.buffer.indexOf('\n', start)
+    }
+    if (start > 0) this.buffer = this.buffer.slice(start)
+    this.scanned = this.buffer.length
+  }
+
+  end(): void {
+    this.buffer += this.decoder.end()
+    const rest = this.buffer
+    this.buffer = ''
+    this.scanned = 0
+    if (rest) this.emit(rest)
+  }
+
+  private emit(raw: string): void {
+    try {
+      this.onLine(raw.endsWith('\r') ? raw.slice(0, -1) : raw)
+    } catch (err) {
+      process.stderr.write(`pi-acp: error handling a pi record: ${String((err as Error)?.stack ?? err)}\n`)
+    }
+  }
+}
+
+/** What pi did with a `prompt` (`data.disposition` of its response, pi 1.x). */
+export type PromptDisposition = 'started' | 'queued' | 'handled'
+
+export type PromptOptions = {
+  /** How pi should queue the message when a run is already streaming. Ignored while idle. */
+  streamingBehavior?: 'steer' | 'followUp'
+}
 
 export class PiRpcSpawnError extends Error {
   /** Underlying spawn error code, e.g. ENOENT, EACCES */
@@ -30,7 +81,7 @@ function stripAnsi(s: string): string {
 }
 
 type PiRpcCommand =
-  | { type: 'prompt'; id?: string; message: string; images?: unknown[] }
+  | { type: 'prompt'; id?: string; message: string; images?: unknown[]; streamingBehavior?: 'steer' | 'followUp' }
   | { type: 'steer'; id?: string; message: string; images?: unknown[] }
   | { type: 'clear_queue'; id?: string }
   | { type: 'abort'; id?: string }
@@ -54,6 +105,7 @@ type PiRpcCommand =
   | { type: 'switch_session'; id?: string; sessionPath: string }
   // Messages
   | { type: 'get_messages'; id?: string }
+  | { type: 'get_entries'; id?: string }
   // Fork / clone
   | { type: 'get_fork_messages'; id?: string }
   | { type: 'fork'; id?: string; entryId: string }
@@ -89,44 +141,27 @@ export class PiRpcProcess {
   private readonly child: ChildProcessWithoutNullStreams
   private readonly pending = new Map<string, { resolve: (v: PiRpcResponse) => void; reject: (e: unknown) => void }>()
   private eventHandlers: Array<(ev: PiRpcEvent) => void> = []
+  private exitHandlers: Array<(info: { code: number | null; signal: NodeJS.Signals | null }) => void> = []
   private readonly preludeLines: string[] = []
 
   private constructor(child: ChildProcessWithoutNullStreams) {
     this.child = child
 
-    const rl = readline.createInterface({ input: child.stdout })
-    rl.on('line', line => {
-      if (!line.trim()) return
-      let msg: any
-      try {
-        msg = JSON.parse(line)
-      } catch {
-        // pi may emit a human-readable prelude on stdout before NDJSON starts.
-        // Capture it so the ACP adapter can surface it on session start.
-        const cleaned = stripAnsi(String(line)).trimEnd()
-        if (cleaned) this.preludeLines.push(cleaned)
-        return
-      }
-
-      if (msg?.type === 'response') {
-        const id = typeof msg.id === 'string' ? msg.id : undefined
-        if (id) {
-          const pending = this.pending.get(id)
-          if (pending) {
-            this.pending.delete(id)
-            pending.resolve(msg as PiRpcResponse)
-            return
-          }
-        }
-      }
-
-      for (const h of this.eventHandlers) h(msg as PiRpcEvent)
-    })
+    const lines = new JsonlLineSplitter(line => this.handleLine(line))
+    child.stdout.on('data', (chunk: Buffer) => lines.push(chunk))
+    child.stdout.on('end', () => lines.end())
 
     child.on('exit', (code, signal) => {
       const err = new Error(`pi process exited (code=${code}, signal=${signal})`)
       for (const [, p] of this.pending) p.reject(err)
       this.pending.clear()
+      for (const h of this.exitHandlers) {
+        try {
+          h({ code, signal })
+        } catch {
+          // a handler must not keep the others from running
+        }
+      }
     })
 
     child.on('error', err => {
@@ -226,10 +261,46 @@ export class PiRpcProcess {
     return proc
   }
 
+  private handleLine(line: string): void {
+    if (!line.trim()) return
+    let msg: any
+    try {
+      msg = JSON.parse(line)
+    } catch {
+      // pi may emit a human-readable prelude on stdout before NDJSON starts.
+      // Capture it so the ACP adapter can surface it on session start.
+      const cleaned = stripAnsi(String(line)).trimEnd()
+      if (cleaned) this.preludeLines.push(cleaned)
+      return
+    }
+
+    if (msg?.type === 'response') {
+      const id = typeof msg.id === 'string' ? msg.id : undefined
+      if (id) {
+        const pending = this.pending.get(id)
+        if (pending) {
+          this.pending.delete(id)
+          pending.resolve(msg as PiRpcResponse)
+          return
+        }
+      }
+    }
+
+    for (const h of this.eventHandlers) h(msg as PiRpcEvent)
+  }
+
   onEvent(handler: (ev: PiRpcEvent) => void): () => void {
     this.eventHandlers.push(handler)
     return () => {
       this.eventHandlers = this.eventHandlers.filter(h => h !== handler)
+    }
+  }
+
+  /** Called once when the pi child exits (after pending requests were rejected). */
+  onExit(handler: (info: { code: number | null; signal: NodeJS.Signals | null }) => void): () => void {
+    this.exitHandlers.push(handler)
+    return () => {
+      this.exitHandlers = this.exitHandlers.filter(h => h !== handler)
     }
   }
 
@@ -251,9 +322,26 @@ export class PiRpcProcess {
     return lines
   }
 
-  async prompt(message: string, images: unknown[] = []): Promise<void> {
-    const res = await this.request({ type: 'prompt', message, images })
+  /**
+   * Send a prompt. Resolves once pi has accepted it, with what pi did with it
+   * (pi 1.x): `started` a run, `queued` it into the running one (only with a
+   * `streamingBehavior`), or `handled` it without a run (an extension command
+   * or input handler). Older pi sends no disposition (`undefined`).
+   */
+  async prompt(
+    message: string,
+    images: unknown[] = [],
+    opts: PromptOptions = {}
+  ): Promise<PromptDisposition | undefined> {
+    const res = await this.request({
+      type: 'prompt',
+      message,
+      images,
+      ...(opts.streamingBehavior ? { streamingBehavior: opts.streamingBehavior } : {})
+    })
     if (!res.success) throw new Error(`pi prompt failed: ${res.error ?? JSON.stringify(res.data)}`)
+    const disposition = (res.data as { disposition?: unknown } | undefined)?.disposition
+    return disposition === 'started' || disposition === 'queued' || disposition === 'handled' ? disposition : undefined
   }
 
   /**
@@ -360,6 +448,17 @@ export class PiRpcProcess {
     const res = await this.request({ type: 'get_messages' })
     if (!res.success) throw new Error(`pi get_messages failed: ${res.error ?? JSON.stringify(res.data)}`)
     return res.data
+  }
+
+  /** Every session entry in append order (all branches) and the current leaf id. */
+  async getEntries(): Promise<{ entries: unknown[]; leafId: string | null }> {
+    const res = await this.request({ type: 'get_entries' })
+    if (!res.success) throw new Error(`pi get_entries failed: ${res.error ?? JSON.stringify(res.data)}`)
+    const data = (res.data ?? {}) as { entries?: unknown; leafId?: unknown }
+    return {
+      entries: Array.isArray(data.entries) ? data.entries : [],
+      leafId: typeof data.leafId === 'string' ? data.leafId : null
+    }
   }
 
   async getCommands(): Promise<unknown> {

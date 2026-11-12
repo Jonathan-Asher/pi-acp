@@ -35,11 +35,14 @@ import {
   thinkingLevelsForModel
 } from './thinking-levels.js'
 import { getAuthMethods } from './auth.js'
-import { SessionManager, type PiAcpSession, type SteerOutcome } from './session.js'
+import { SessionManager, type PiAcpSession, type SessionFeatures, type SteerOutcome } from './session.js'
+import { AIR_ASYNC_TASKS, ASYNC_TASK_STOP_METHOD, clientSupportsAsyncTasks, isAirClient } from './live/air.js'
+import { liveCapabilities } from './live/wire.js'
+import { activeBranchCustomEntries, planReplay } from './replay.js'
+import { sessionHeaderId } from './live/session-header.js'
 import { SessionStore } from './session-store.js'
 import { PiRpcProcess } from '../pi-rpc/process.js'
 import { listPiSessions, findPiSession } from './pi-sessions.js'
-import { normalizePiAssistantText, normalizePiMessageText } from './translate/pi-messages.js'
 import { toolResultToText } from './translate/pi-tools.js'
 import { forkSessionFile, ForkPointError, type ForkPoint, type ForkedSessionFile } from './session-fork.js'
 import {
@@ -217,6 +220,8 @@ export class PiAcpAgent implements ACPAgent {
   private readonly sessions = new SessionManager()
   private readonly store = new SessionStore()
   private readonly restoringSessions = new Map<string, Promise<PiAcpSession>>()
+  // What the client negotiated in `initialize` (AIR async tasks).
+  private features: SessionFeatures = { asyncTasks: false }
 
   dispose(): void {
     this.sessions.disposeAll()
@@ -308,7 +313,8 @@ export class PiAcpAgent implements ACPAgent {
         mcpServers: opts?.mcpServers ?? [],
         conn: this.conn,
         proc,
-        fileCommands
+        fileCommands,
+        features: this.features
       })
 
       this.lastSessionCwd = cwd
@@ -330,6 +336,8 @@ export class PiAcpAgent implements ACPAgent {
     // We currently only support ACP protocol version 1.
     const supportedVersion = 1
     const requested = params.protocolVersion
+    const clientCapabilities = (params as { clientCapabilities?: unknown }).clientCapabilities
+    this.features = { asyncTasks: clientSupportsAsyncTasks(clientCapabilities) }
 
     return {
       protocolVersion: requested === supportedVersion ? requested : supportedVersion,
@@ -374,14 +382,39 @@ export class PiAcpAgent implements ACPAgent {
         // `invalid_params` (`strict`), and forks from the session file without
         // opening the source in pi, so a session with a turn in flight can be
         // forked from another process (`whileRunning`).
-        forkPoint: { strict: true, whileRunning: true }
+        forkPoint: { strict: true, whileRunning: true },
+        // The structured live channel (`_meta.piAcp.*` on session updates):
+        // turns pi starts by itself, extension notices, sub-agent run cards,
+        // background jobs, compaction, extension commands, and the same data on
+        // session/load replay. Each value is that shape's version.
+        piAcp: { capabilities: liveCapabilities() },
+        // AIR capabilities go only to an AIR client (one that sent `_meta.jetbrains.air`).
+        ...(isAirClient(clientCapabilities)
+          ? { jetbrains: { air: { version: 1, capabilities: [AIR_ASYNC_TASKS] } } }
+          : {})
       }
     }
   }
 
   async extMethod(method: string, params: Record<string, unknown>): Promise<Record<string, unknown>> {
     if (method === STEER_METHOD) return this.steer(parseSteerRequest(params))
+    if (method === ASYNC_TASK_STOP_METHOD) return this.stopAsyncTask(params)
     throw RequestError.methodNotFound(method)
+  }
+
+  /**
+   * AIR `_session/async_task/stop` (`{sessionId, asyncTaskId}` → `{stopped}`):
+   * a turn pi started by itself, a background job, or an async sub-agent run.
+   */
+  private async stopAsyncTask(params: Record<string, unknown>): Promise<{ stopped: boolean }> {
+    const sessionId = typeof params?.sessionId === 'string' ? params.sessionId.trim() : ''
+    const asyncTaskId = typeof params?.asyncTaskId === 'string' ? params.asyncTaskId.trim() : ''
+    if (!sessionId) throw RequestError.invalidParams(undefined, 'async task stop params require a non-empty sessionId')
+    if (!asyncTaskId)
+      throw RequestError.invalidParams(undefined, 'async task stop params require a non-empty asyncTaskId')
+    const session = this.sessions.maybeGet(sessionId)
+    if (!session) return { stopped: false }
+    return session.stopAsyncTask(asyncTaskId)
   }
 
   /**
@@ -419,7 +452,8 @@ export class PiAcpAgent implements ACPAgent {
       mcpServers: params.mcpServers,
       conn: this.conn,
       fileCommands,
-      piCommand: process.env.PI_ACP_PI_COMMAND
+      piCommand: process.env.PI_ACP_PI_COMMAND,
+      features: this.features
     })
     await applySessionName(session, params)
 
@@ -1033,10 +1067,14 @@ export class PiAcpAgent implements ACPAgent {
     // ACP: filter by cwd if provided.
     // Zed currently sends `{}` (no cwd), so we default to the last session cwd to
     // emulate pi's `/resume` picker (project-scoped).
-    const all = listPiSessions()
+    const all = listPiSessions({ topLevel: true })
 
     const effectiveCwd = (params as any).cwd ?? this.lastSessionCwd
-    const filtered = effectiveCwd ? all.filter(s => s.cwd === effectiveCwd) : all
+    // pi records a session's cwd as its real path (`/tmp/x` is stored as
+    // `/private/tmp/x` on macOS), so compare real paths.
+    const realCwd = memoizedRealpath()
+    const wanted = effectiveCwd ? realCwd(effectiveCwd) : null
+    const filtered = wanted ? all.filter(s => s.cwd === effectiveCwd || realCwd(s.cwd) === wanted) : all
 
     // Cursor-based pagination (opaque cursor). For MVP, we use a simple numeric offset.
     // If cursor is invalid, treat as 0.
@@ -1095,101 +1133,116 @@ export class PiAcpAgent implements ACPAgent {
       sessionFile: stored.sessionFile
     })
 
-    // Replay full conversation history.
+    // Replay full conversation history, with the live channel's structured
+    // data (`_meta.piAcp`): sub-agent and job cards in their final state,
+    // extension notices, and the runs pi started by itself.
     const data = (await proc.getMessages()) as any
     const messages = Array.isArray(data?.messages) ? data.messages : []
+    let customEntries: unknown[] = []
+    try {
+      if (typeof (proc as { getEntries?: unknown }).getEntries === 'function') {
+        const { entries, leafId } = await proc.getEntries()
+        customEntries = activeBranchCustomEntries(entries, leafId)
+      }
+    } catch {
+      // an older pi without get_entries: notices still replay, answers and silent exits do not
+    }
 
-    for (const m of messages) {
-      const role = String(m?.role ?? '')
-
-      if (role === 'user') {
-        const text = normalizePiMessageText(m?.content)
-        if (text) {
-          await this.conn.sessionUpdate({
-            sessionId: session.sessionId,
-            update: {
-              sessionUpdate: 'user_message_chunk',
-              content: { type: 'text', text }
-            }
-          })
-        }
+    for (const step of planReplay(messages, customEntries, { sessionIdOf: sessionHeaderId })) {
+      if (step.kind === 'user') {
+        await this.conn.sessionUpdate({
+          sessionId: session.sessionId,
+          update: {
+            sessionUpdate: 'user_message_chunk',
+            content: { type: 'text', text: step.text }
+          }
+        })
+        continue
       }
 
-      if (role === 'assistant') {
-        const text = normalizePiAssistantText(m?.content)
-        if (text) {
-          await this.conn.sessionUpdate({
-            sessionId: session.sessionId,
-            update: {
-              sessionUpdate: 'agent_message_chunk',
-              content: { type: 'text', text }
-            }
-          })
-        }
+      if (step.kind === 'assistant') {
+        await this.conn.sessionUpdate({
+          sessionId: session.sessionId,
+          update: {
+            sessionUpdate: 'agent_message_chunk',
+            content: { type: 'text', text: step.text }
+          }
+        })
+        continue
       }
 
-      if (role === 'toolResult') {
-        const toolName = String((m as any)?.toolName ?? 'tool')
-        const toolCallId = String((m as any)?.toolCallId ?? crypto.randomUUID())
-        const isError = Boolean((m as any)?.isError)
-        const isBash = isBashTool(toolName)
+      if (step.kind === 'info') {
+        await this.conn.sessionUpdate({
+          sessionId: session.sessionId,
+          update: { sessionUpdate: 'session_info_update', _meta: { piAcp: step.meta } }
+        })
+        continue
+      }
 
-        if (isBash) {
-          const text = bashResultText(m)
-          await this.conn.sessionUpdate({
-            sessionId: session.sessionId,
-            update: {
-              sessionUpdate: 'tool_call',
-              toolCallId,
-              title: bashCommand(m) ?? toolName,
-              kind: 'execute',
-              status: 'completed',
-              content: bashTerminalContent(toolCallId),
-              _meta: bashTerminalInfoMeta(toolCallId, params.cwd)
-            }
-          })
+      const m = step.message as any
+      const toolName = String(m?.toolName ?? 'tool')
+      const toolCallId = String(m?.toolCallId ?? crypto.randomUUID())
+      const isError = Boolean(m?.isError)
+      const isBash = isBashTool(toolName)
 
-          await this.conn.sessionUpdate({
-            sessionId: session.sessionId,
-            update: {
-              sessionUpdate: 'tool_call_update',
-              toolCallId,
-              status: isError ? 'failed' : 'completed',
-              _meta: {
-                ...(text ? bashTerminalOutputMeta(toolCallId, text) : {}),
-                ...bashTerminalExitMeta(toolCallId, bashExitCode(m, isError))
-              }
-            }
-          })
-          continue
-        }
-
-        // Create a synthetic ACP tool call to render historic tool usage.
+      if (isBash) {
+        const text = bashResultText(m)
         await this.conn.sessionUpdate({
           sessionId: session.sessionId,
           update: {
             sessionUpdate: 'tool_call',
             toolCallId,
-            title: toolName,
-            kind: toolName === 'read' ? 'read' : toolName === 'write' || toolName === 'edit' ? 'edit' : 'other',
+            title: bashCommand(m) ?? bashCommand(step.args) ?? toolName,
+            kind: 'execute',
             status: 'completed',
-            rawInput: null,
-            rawOutput: m
+            content: bashTerminalContent(toolCallId),
+            _meta: bashTerminalInfoMeta(toolCallId, params.cwd)
           }
         })
 
-        const text = toolResultToText(m)
         await this.conn.sessionUpdate({
           sessionId: session.sessionId,
           update: {
             sessionUpdate: 'tool_call_update',
             toolCallId,
             status: isError ? 'failed' : 'completed',
-            content: text ? [{ type: 'content', content: { type: 'text', text } }] : null,
-            rawOutput: m
+            _meta: {
+              ...(text ? bashTerminalOutputMeta(toolCallId, text) : {}),
+              ...bashTerminalExitMeta(toolCallId, bashExitCode(m, isError))
+            }
           }
         })
+        continue
       }
+
+      // Create a synthetic ACP tool call to render historic tool usage.
+      const live = step.live ? { _meta: { piAcp: step.live } } : {}
+      await this.conn.sessionUpdate({
+        sessionId: session.sessionId,
+        update: {
+          sessionUpdate: 'tool_call',
+          toolCallId,
+          title: toolName,
+          kind: toolName === 'read' ? 'read' : toolName === 'write' || toolName === 'edit' ? 'edit' : 'other',
+          status: 'completed',
+          rawInput: step.args ?? null,
+          rawOutput: m,
+          ...live
+        }
+      })
+
+      const text = toolResultToText(m)
+      await this.conn.sessionUpdate({
+        sessionId: session.sessionId,
+        update: {
+          sessionUpdate: 'tool_call_update',
+          toolCallId,
+          status: isError ? 'failed' : 'completed',
+          content: text ? [{ type: 'content', content: { type: 'text', text } }] : null,
+          rawOutput: m,
+          ...live
+        }
+      })
     }
 
     const { configOptions, models, modes } = await getSessionConfiguration(proc)
@@ -1679,6 +1732,23 @@ async function setSessionModel(proc: PiRpcProcess, requestedModelId: string): Pr
   }
 
   await proc.setModel(provider, modelId)
+}
+
+/** `realpath`, memoized for one listing; a path that does not resolve is kept as it is. */
+function memoizedRealpath(): (path: string) => string {
+  const memo = new Map<string, string>()
+  return (path: string) => {
+    let real = memo.get(path)
+    if (real === undefined) {
+      try {
+        real = realpathSync(path)
+      } catch {
+        real = path
+      }
+      memo.set(path, real)
+    }
+    return real
+  }
 }
 
 function isSemver(v: string): boolean {

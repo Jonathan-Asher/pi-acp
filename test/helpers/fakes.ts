@@ -1,5 +1,5 @@
 import type { AgentSideConnection } from '@agentclientprotocol/sdk'
-import type { PiRpcEvent } from '../../src/pi-rpc/process.js'
+import type { PiRpcEvent, PromptDisposition, PromptOptions } from '../../src/pi-rpc/process.js'
 
 type SessionUpdateMsg = Parameters<AgentSideConnection['sessionUpdate']>[0]
 
@@ -27,8 +27,17 @@ export class FakePiRpcProcess {
 
   // spies
   readonly prompts: Array<{ message: string; attachments: unknown[] }> = []
+  readonly promptOptions: PromptOptions[] = []
   readonly extensionUiResponses: unknown[] = []
   abortCount = 0
+  /** What pi answers each prompt with, in order; then `defaultDisposition`. */
+  dispositions: Array<PromptDisposition | undefined> = []
+  defaultDisposition: PromptDisposition | undefined = undefined
+  /** Extension commands `get_commands` lists. */
+  commands: Array<{ name: string; source?: string }> = []
+  entries: unknown[] = []
+  leafId: string | null = null
+  private exitHandlers: Array<(info: { code: number | null; signal: NodeJS.Signals | null }) => void> = []
 
   onEvent(handler: (ev: PiRpcEvent) => void): () => void {
     this.handlers.push(handler)
@@ -41,9 +50,35 @@ export class FakePiRpcProcess {
     for (const h of this.handlers) h(ev)
   }
 
-  async prompt(message: string, attachments: unknown[] = []): Promise<void> {
+  async prompt(
+    message: string,
+    attachments: unknown[] = [],
+    opts: PromptOptions = {}
+  ): Promise<PromptDisposition | undefined | void> {
     this.prompts.push({ message, attachments })
+    this.promptOptions.push(opts)
     if (this.promptError) throw this.promptError
+    return this.dispositions.length ? this.dispositions.shift() : this.defaultDisposition
+  }
+
+  onExit(handler: (info: { code: number | null; signal: NodeJS.Signals | null }) => void): () => void {
+    this.exitHandlers.push(handler)
+    return () => {
+      this.exitHandlers = this.exitHandlers.filter(h => h !== handler)
+    }
+  }
+
+  /** The pi child exits. */
+  exit(code: number | null = 1, signal: NodeJS.Signals | null = null): void {
+    for (const h of this.exitHandlers) h({ code, signal })
+  }
+
+  async getCommands(): Promise<any> {
+    return { commands: this.commands }
+  }
+
+  async getEntries(): Promise<{ entries: unknown[]; leafId: string | null }> {
+    return { entries: this.entries, leafId: this.leafId }
   }
 
   async abort(): Promise<void> {

@@ -41,7 +41,11 @@ export function getPiSessionsDir(): string {
   return readSessionDirFromSettings(agentDir) ?? join(agentDir, 'sessions')
 }
 
-function walkJsonlFiles(dir: string, out: string[]) {
+/**
+ * The `.jsonl` files under `dir`, at most `maxDepth` levels down (1 = files in
+ * `dir` itself).
+ */
+function walkJsonlFiles(dir: string, out: string[], maxDepth = Infinity, depth = 1) {
   let entries: import('node:fs').Dirent[]
   try {
     // Force string names.
@@ -53,8 +57,9 @@ function walkJsonlFiles(dir: string, out: string[]) {
   for (const e of entries) {
     const name = typeof (e as any).name === 'string' ? (e as any).name : String((e as any).name)
     const p = join(dir, name)
-    if (e.isDirectory()) walkJsonlFiles(p, out)
-    else if (e.isFile() && name.endsWith('.jsonl')) out.push(p)
+    if (e.isDirectory()) {
+      if (depth < maxDepth) walkJsonlFiles(p, out, maxDepth, depth + 1)
+    } else if (e.isFile() && name.endsWith('.jsonl')) out.push(p)
   }
 }
 
@@ -262,10 +267,17 @@ function pickFallbackTitleFromHead(path: string): string | null {
   return null
 }
 
-export function listPiSessions(): PiSessionListItem[] {
+/**
+ * pi's sessions. `topLevel` lists what pi's own `/resume` lists: session files
+ * in the sessions folder or one (per-cwd) folder below it. Deeper files are
+ * pi-subagents' child sessions (`<parent>/<run id>/run-N/session.jsonl`) and
+ * its artifact transcripts, which belong to their parent session; lookups by id
+ * still find them.
+ */
+export function listPiSessions(opts: { topLevel?: boolean } = {}): PiSessionListItem[] {
   const sessionsDir = getPiSessionsDir()
   const files: string[] = []
-  walkJsonlFiles(sessionsDir, files)
+  walkJsonlFiles(sessionsDir, files, opts.topLevel ? 2 : Infinity)
 
   const items: PiSessionListItem[] = []
 
