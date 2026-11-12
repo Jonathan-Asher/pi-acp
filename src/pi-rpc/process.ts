@@ -1,6 +1,8 @@
 import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process'
+import { mkdirSync } from 'node:fs'
 import * as readline from 'node:readline'
 import { getPiCommand, shouldUseShellForPiCommand } from './command.js'
+import { piChildEnv, SUBAGENTS_TEMP_ROOT_ENV } from './env.js'
 
 export class PiRpcSpawnError extends Error {
   /** Underlying spawn error code, e.g. ENOENT, EACCES */
@@ -144,10 +146,22 @@ export class PiRpcProcess {
     const args = ['--mode', 'rpc', '--no-themes']
     if (params.sessionPath) args.push('--session', params.sessionPath)
 
+    // A stable sub-agent temp root, so pi-subagents' run state outlives a
+    // per-launch TMPDIR (see env.ts).
+    const env = piChildEnv(process.env)
+    const subagentsTempRoot = env[SUBAGENTS_TEMP_ROOT_ENV]
+    if (subagentsTempRoot && subagentsTempRoot !== process.env[SUBAGENTS_TEMP_ROOT_ENV]) {
+      try {
+        mkdirSync(subagentsTempRoot, { recursive: true, mode: 0o700 })
+      } catch {
+        // pi-subagents creates what it needs; a failure here only loses the mode.
+      }
+    }
+
     const child = spawn(cmd, args, {
       cwd: params.cwd,
       stdio: 'pipe',
-      env: process.env,
+      env,
       shell: shouldUseShellForPiCommand(cmd)
     })
 
